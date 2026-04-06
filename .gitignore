@@ -7,10 +7,6 @@
 *.safetensors
 .cache/
 
-# Input/output images and results
-inputs/
-outputs/
-
 # Python
 __pycache__/
 *.py[cod]
