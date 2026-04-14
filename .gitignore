@@ -1,6 +1,13 @@
 # Virtual environment
 .venv/
 
+# Database files
+.chromadb/
+catalog.db
+
+# Claude memory
+.claude/
+
 # Model weights and cache
 *.pt
 *.pth

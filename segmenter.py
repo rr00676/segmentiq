@@ -1,98 +1,95 @@
 from __future__ import annotations
 
-import base64
-import io
+import uuid
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 from PIL import Image
-
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
-# Enable TF32 for better performance on Ampere+ (and Blackwell) GPUs
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+MIN_AREA_FRACTION = 0.01  # discard masks smaller than 1% of image area
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CONFIDENCE_THRESHOLD = 0.5
-
-_model: Optional[object] = None
 _processor: Optional[Sam3Processor] = None
 
 
 def _get_processor() -> Sam3Processor:
-    global _model, _processor
+    global _processor
     if _processor is None:
-        _model = build_sam3_image_model(device=DEVICE)
-        _processor = Sam3Processor(
-            _model, device=DEVICE, confidence_threshold=CONFIDENCE_THRESHOLD
-        )
+        model = build_sam3_image_model()
+        _processor = Sam3Processor(model)
     return _processor
 
 
 @dataclass
-class Instance:
-    id: int
-    confidence: float
-    bounding_box: List[float]  # [x, y, w, h] in pixels, top-left origin
-    mask: str = ""             # base64-encoded PNG of the binary mask (H x W, mode "L")
+class MaskData:
+    id: str                           # UUID — matches ChromaDB and SQLite
+    label: str                        # object type from Gemma (e.g. "zebra")
+    bbox: List[float]                 # [x, y, w, h] in pixels
+    area: int                         # mask area in pixels
+    segmentation: np.ndarray = field(repr=False)  # bool H×W array
 
 
-@dataclass
-class SegmentationResult:
-    query: str
-    objects_found: int
-    instances: List[Instance] = field(default_factory=list)
+def _masks_from_state(state: Dict, label: str, total_pixels: int) -> List[MaskData]:
+    """Extract accepted MaskData from a Sam3Processor result state."""
+    if "masks" not in state or state["masks"].shape[0] == 0:
+        return []
+
+    masks_tensor = state["masks"].squeeze(1)  # (N, H, W)
+    results: List[MaskData] = []
+
+    for i in range(masks_tensor.shape[0]):
+        seg = masks_tensor[i].cpu().bool().numpy()
+        area = int(seg.sum())
+        if area / total_pixels < MIN_AREA_FRACTION:
+            continue
+        ys, xs = np.where(seg)
+        bbox = [float(xs.min()), float(ys.min()),
+                float(xs.max() - xs.min()), float(ys.max() - ys.min())]
+        results.append(MaskData(
+            id=str(uuid.uuid4()),
+            label=label,
+            bbox=bbox,
+            area=area,
+            segmentation=seg,
+        ))
+
+    return results
 
 
-def segment_image(image_path: str, query: str) -> SegmentationResult:
-    """Return all instances of *query* found in the image at *image_path*.
+def segment_image(image_path: str, objects: List[str]) -> List[MaskData]:
+    """Run SAM 3 text-prompted segmentation for each object label.
+
+    Encodes the image once, then runs a separate text prompt for each label,
+    collecting all mask instances that pass the area filter.
 
     Args:
-        image_path: Absolute or relative path to a local image file.
-        query: Natural language description of the object to find (e.g. "dog").
+        image_path: Path to the input image.
+        objects: List of object labels from Gemma (e.g. ["lion", "zebra"]).
 
     Returns:
-        SegmentationResult with one Instance per detected object, each
-        containing a confidence score, bounding box [x, y, w, h], and
-        a base64-encoded PNG mask.
+        List of MaskData across all labels, ordered by area descending.
     """
+    if not objects:
+        return []
+
     processor = _get_processor()
     image = Image.open(image_path).convert("RGB")
+    w, h = image.size
+    total_pixels = w * h
 
-    with torch.autocast(DEVICE, dtype=torch.bfloat16):
+    with torch.autocast("cuda", dtype=torch.bfloat16):
         state = processor.set_image(image)
-        state = processor.set_text_prompt(state=state, prompt=query)
 
-    scores: torch.Tensor = state.get("scores", torch.tensor([]))
-    boxes: torch.Tensor = state.get("boxes", torch.tensor([]))  # XYXY absolute
-    masks: torch.Tensor = state.get("masks", torch.tensor([]))  # (N, 1, H, W) bool
+    all_masks: List[MaskData] = []
 
-    instances: List[Instance] = []
-    for i, (score, box) in enumerate(zip(scores, boxes), start=1):
-        x1, y1, x2, y2 = box.tolist()
+    for label in objects:
+        processor.reset_all_prompts(state)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            result = processor.set_text_prompt(prompt=label, state=state)
+        all_masks.extend(_masks_from_state(result, label, total_pixels))
 
-        mask_b64 = ""
-        if masks.numel() > 0 and i - 1 < masks.shape[0]:
-            mask_np = masks[i - 1, 0].cpu().bool().numpy()
-            mask_img = Image.fromarray((mask_np * 255).astype("uint8"), mode="L")
-            buf = io.BytesIO()
-            mask_img.save(buf, format="PNG")
-            mask_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        instances.append(
-            Instance(
-                id=i,
-                confidence=round(float(score), 4),
-                bounding_box=[round(x1, 1), round(y1, 1), round(x2 - x1, 1), round(y2 - y1, 1)],
-                mask=mask_b64,
-            )
-        )
-
-    return SegmentationResult(
-        query=query,
-        objects_found=len(instances),
-        instances=instances,
-    )
+    all_masks.sort(key=lambda m: m.area, reverse=True)
+    return all_masks
